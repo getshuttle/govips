@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/davidbyttow/govips/v2/vips"
+	"github.com/getshuttle/govips/v2/vips"
 )
 
 func checkError(err error) {
