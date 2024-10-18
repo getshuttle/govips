@@ -286,6 +286,10 @@ func vipsLoadFromBuffer(buf []byte, params *ImportParams) (*C.VipsImage, ImageTy
 		currentType = ImageTypePNG
 	}
 
+	if params.ForceImageType != ImageTypeUnknown {
+		currentType = params.ForceImageType
+	}
+
 	if !IsTypeSupported(currentType) {
 		govipsLog("govips", LogLevelInfo, fmt.Sprintf("failed to understand image format size=%d", len(src)))
 		return nil, currentType, originalType, ErrUnsupportedImageFormat

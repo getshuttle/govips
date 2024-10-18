@@ -110,6 +110,8 @@ type ImportParams struct {
 	JpegShrinkFactor IntParameter
 	HeifThumbnail    BoolParameter
 	SvgUnlimited     BoolParameter
+
+	ForceImageType ImageType
 }
 
 // NewImportParams creates default ImportParams
