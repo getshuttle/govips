@@ -15,7 +15,7 @@ func init() {
 	}, vips.LogLevelDebug)
 
 	// Disable the cache so that after GC, libvips does not hold reference to any object
-	vips.Startup(&vips.Config{
+	if err := vips.Startup(&vips.Config{
 		ConcurrencyLevel: 0,
 		MaxCacheFiles:    0,
 		MaxCacheMem:      0,
@@ -23,7 +23,9 @@ func init() {
 		ReportLeaks:      false,
 		CacheTrace:       false,
 		CollectStats:     false,
-	})
+	}); err != nil {
+		panic(err)
+	}
 }
 
 func BenchmarkBlack(b *testing.B) {

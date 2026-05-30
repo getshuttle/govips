@@ -5,13 +5,12 @@ import "C"
 import (
 	"bytes"
 	"encoding/xml"
+	"errors"
 	"fmt"
-	"image/png"
 	"math"
 	"runtime"
 	"unsafe"
 
-	"golang.org/x/image/bmp"
 	"golang.org/x/net/html/charset"
 )
 
@@ -20,10 +19,10 @@ type SubsampleMode int
 
 // SubsampleMode enum correlating to libvips subsample modes
 const (
-	VipsForeignSubsampleAuto SubsampleMode = C.VIPS_FOREIGN_JPEG_SUBSAMPLE_AUTO
-	VipsForeignSubsampleOn   SubsampleMode = C.VIPS_FOREIGN_JPEG_SUBSAMPLE_ON
-	VipsForeignSubsampleOff  SubsampleMode = C.VIPS_FOREIGN_JPEG_SUBSAMPLE_OFF
-	VipsForeignSubsampleLast SubsampleMode = C.VIPS_FOREIGN_JPEG_SUBSAMPLE_LAST
+	VipsForeignSubsampleAuto SubsampleMode = C.VIPS_FOREIGN_SUBSAMPLE_AUTO
+	VipsForeignSubsampleOn   SubsampleMode = C.VIPS_FOREIGN_SUBSAMPLE_ON
+	VipsForeignSubsampleOff  SubsampleMode = C.VIPS_FOREIGN_SUBSAMPLE_OFF
+	VipsForeignSubsampleLast SubsampleMode = C.VIPS_FOREIGN_SUBSAMPLE_LAST
 )
 
 // ImageType represents an image type
@@ -45,7 +44,14 @@ const (
 	ImageTypeAVIF    ImageType = C.AVIF
 	ImageTypeJP2K    ImageType = C.JP2K
 	ImageTypeJXL     ImageType = C.JXL
+	ImageTypePSD     ImageType = C.PSD
 )
+
+// Types which should be deligated to ImageMagick loader
+var imageMagickTypes = map[ImageType]bool{
+	ImageTypeBMP: true,
+	ImageTypePSD: true,
+}
 
 var imageTypeExtensionMap = map[ImageType]string{
 	ImageTypeGIF:    ".gif",
@@ -61,6 +67,7 @@ var imageTypeExtensionMap = map[ImageType]string{
 	ImageTypeAVIF:   ".avif",
 	ImageTypeJP2K:   ".jp2",
 	ImageTypeJXL:    ".jxl",
+	ImageTypePSD:    ".psd",
 }
 
 // ImageTypes defines the various image types supported by govips
@@ -78,6 +85,7 @@ var ImageTypes = map[ImageType]string{
 	ImageTypeAVIF:   "heif",
 	ImageTypeJP2K:   "jp2k",
 	ImageTypeJXL:    "jxl",
+	ImageTypePSD:    "psd",
 }
 
 // TiffCompression represents method for compressing a tiff at export
@@ -119,6 +127,15 @@ const (
 	PngFilterAll   PngFilter = C.VIPS_FOREIGN_PNG_FILTER_ALL
 )
 
+// Access represents how libvips opens files.
+// See https://www.libvips.org/API/current/How-it-opens-files.html
+const (
+	AccessRandom               int = C.VIPS_ACCESS_RANDOM
+	AccessSequential           int = C.VIPS_ACCESS_SEQUENTIAL
+	AccessSequentialUnbuffered int = C.VIPS_ACCESS_SEQUENTIAL_UNBUFFERED
+	AccessLast                 int = C.VIPS_ACCESS_LAST
+)
+
 // FileExt returns the canonical extension for the ImageType
 func (i ImageType) FileExt() string {
 	if ext, ok := imageTypeExtensionMap[i]; ok {
@@ -129,7 +146,15 @@ func (i ImageType) FileExt() string {
 
 // IsTypeSupported checks whether given image type is supported by govips
 func IsTypeSupported(imageType ImageType) bool {
-	startupIfNeeded()
+	if err := startupIfNeeded(); err != nil {
+		govipsLog("govips", LogLevelError, fmt.Sprintf("failed to start vips: %v", err))
+		return false
+	}
+
+	// BMP is supported via the magick loader
+	if imageType == ImageTypeBMP {
+		return supportedImageTypes[ImageTypeMagick]
+	}
 
 	return supportedImageTypes[imageType]
 }
@@ -154,14 +179,18 @@ func DetermineImageType(buf []byte) ImageType {
 		return ImageTypeHEIF
 	} else if isSVG(buf) {
 		return ImageTypeSVG
-	} else if isPDF(buf) {
-		return ImageTypePDF
 	} else if isBMP(buf) {
 		return ImageTypeBMP
 	} else if isJP2K(buf) {
 		return ImageTypeJP2K
 	} else if isJXL(buf) {
 		return ImageTypeJXL
+	} else if isPDF(buf) {
+		return ImageTypePDF
+	} else if isICO(buf) {
+		return ImageTypeMagick
+	} else if isPSD(buf) {
+		return ImageTypePSD
 	} else {
 		return ImageTypeUnknown
 	}
@@ -187,9 +216,14 @@ func isPNG(buf []byte) bool {
 
 var tifII = []byte("\x49\x49\x2A\x00")
 var tifMM = []byte("\x4D\x4D\x00\x2A")
+var bigTifII = []byte("\x49\x49\x2B\x00")
+var bigTifMM = []byte("\x4D\x4D\x00\x2B")
 
 func isTIFF(buf []byte) bool {
-	return bytes.HasPrefix(buf, tifII) || bytes.HasPrefix(buf, tifMM)
+	return bytes.HasPrefix(buf, tifII) ||
+		bytes.HasPrefix(buf, tifMM) ||
+		bytes.HasPrefix(buf, bigTifII) ||
+		bytes.HasPrefix(buf, bigTifMM)
 }
 
 var webpHeader = []byte("\x57\x45\x42\x50")
@@ -201,19 +235,27 @@ func isWEBP(buf []byte) bool {
 // https://github.com/strukturag/libheif/blob/master/libheif/heif.cc
 var ftyp = []byte("ftyp")
 var heic = []byte("heic")
+var heix = []byte("heix")
+var heim = []byte("heim")
+var heis = []byte("heis")
 var mif1 = []byte("mif1")
 var msf1 = []byte("msf1")
 var avif = []byte("avif")
+var avis = []byte("avis")
 
 func isHEIF(buf []byte) bool {
 	return bytes.Equal(buf[4:8], ftyp) && (bytes.Equal(buf[8:12], heic) ||
+		bytes.Equal(buf[8:12], heix) ||
+		bytes.Equal(buf[8:12], heim) ||
+		bytes.Equal(buf[8:12], heis) ||
 		bytes.Equal(buf[8:12], mif1) ||
 		bytes.Equal(buf[8:12], msf1)) ||
 		isAVIF(buf)
 }
 
 func isAVIF(buf []byte) bool {
-	return bytes.Equal(buf[4:8], ftyp) && bytes.Equal(buf[8:12], avif)
+	return bytes.Equal(buf[4:8], ftyp) &&
+		(bytes.Equal(buf[8:12], avif) || bytes.Equal(buf[8:12], avis))
 }
 
 var svg = []byte("<svg")
@@ -240,7 +282,10 @@ func isSVG(buf []byte) bool {
 var pdf = []byte("\x25\x50\x44\x46")
 
 func isPDF(buf []byte) bool {
-	return bytes.HasPrefix(buf, pdf)
+	if len(buf) <= 1024 {
+		return bytes.Contains(buf, pdf)
+	}
+	return bytes.Contains(buf[:1024], pdf)
 }
 
 var bmpHeader = []byte("BM")
@@ -264,7 +309,29 @@ var jxlHeader = []byte("\xff\x0a")
 var jxlHeaderISOBMFF = []byte("\x00\x00\x00\x0C\x4A\x58\x4C\x20\x0D\x0A\x87\x0A")
 
 func isJXL(buf []byte) bool {
-	return bytes.HasPrefix(buf, jxlHeader) || bytes.HasPrefix(buf, jxlHeaderISOBMFF)
+	if len(buf) >= 2 && buf[0] == 0xFF && buf[1] == 0x0A {
+		return true
+	}
+	if len(buf) >= 8 && bytes.Equal(buf[4:8], []byte("JXL ")) {
+		return true
+	}
+	return false
+}
+
+var icoHeader = []byte("\x00\x00\x01\x00")
+
+func isICO(buf []byte) bool {
+	return bytes.HasPrefix(buf, icoHeader)
+}
+
+var psdHeader = []byte("\x38\x42\x50\x53")
+
+func isPSD(buf []byte) bool {
+	return bytes.HasPrefix(buf, psdHeader)
+}
+
+func isNeedToChangeLoaderToMagick(t ImageType) bool {
+	return imageMagickTypes[t]
 }
 
 func vipsLoadFromBuffer(buf []byte, params *ImportParams) (*C.VipsImage, ImageType, ImageType, error) {
@@ -272,18 +339,12 @@ func vipsLoadFromBuffer(buf []byte, params *ImportParams) (*C.VipsImage, ImageTy
 	// Reference src here so it's not garbage collected during image initialization.
 	defer runtime.KeepAlive(src)
 
-	var err error
-
 	originalType := DetermineImageType(src)
 	currentType := originalType
 
-	if originalType == ImageTypeBMP {
-		src, err = bmpToPNG(src)
-		if err != nil {
-			return nil, currentType, originalType, err
-		}
-
-		currentType = ImageTypePNG
+	// Map image types which are not supported by libvips itself to ImageMagick
+	if isNeedToChangeLoaderToMagick(originalType) {
+		currentType = ImageTypeMagick
 	}
 
 	if params.ForceImageType != ImageTypeUnknown {
@@ -304,24 +365,6 @@ func vipsLoadFromBuffer(buf []byte, params *ImportParams) (*C.VipsImage, ImageTy
 	return importParams.outputImage, currentType, originalType, nil
 }
 
-func bmpToPNG(src []byte) ([]byte, error) {
-	i, err := bmp.Decode(bytes.NewReader(src))
-	if err != nil {
-		return nil, err
-	}
-
-	var w bytes.Buffer
-	pngEnc := png.Encoder{
-		CompressionLevel: png.NoCompression,
-	}
-	err = pngEnc.Encode(&w, i)
-	if err != nil {
-		return nil, err
-	}
-
-	return w.Bytes(), nil
-}
-
 func maybeSetBoolParam(p BoolParameter, cp *C.Param) {
 	if p.IsSet() {
 		C.set_bool_param(cp, toGboolean(p.Get()))
@@ -334,6 +377,12 @@ func maybeSetIntParam(p IntParameter, cp *C.Param) {
 	}
 }
 
+func maybeSetDoubleParam(p Float64Parameter, cp *C.Param) {
+	if p.IsSet() {
+		C.set_double_param(cp, C.gdouble(p.Get()))
+	}
+}
+
 func createImportParams(format ImageType, params *ImportParams) C.LoadParams {
 	p := C.create_load_params(C.ImageType(format))
 
@@ -342,8 +391,10 @@ func createImportParams(format ImageType, params *ImportParams) C.LoadParams {
 	maybeSetIntParam(params.Page, &p.page)
 	maybeSetIntParam(params.NumPages, &p.n)
 	maybeSetIntParam(params.JpegShrinkFactor, &p.jpegShrink)
+	maybeSetDoubleParam(params.WebpScaleFactor, &p.webpScale)
 	maybeSetBoolParam(params.HeifThumbnail, &p.heifThumbnail)
 	maybeSetBoolParam(params.SvgUnlimited, &p.svgUnlimited)
+	maybeSetIntParam(params.Access, &p.access)
 
 	if params.Density.IsSet() {
 		C.set_double_param(&p.dpi, C.gdouble(params.Density.Get()))
@@ -360,7 +411,7 @@ func vipsSaveJPEGToBuffer(in *C.VipsImage, params JpegExportParams) ([]byte, err
 	p.quality = C.int(params.Quality)
 	p.interlace = C.int(boolToInt(params.Interlace))
 	p.jpegOptimizeCoding = C.int(boolToInt(params.OptimizeCoding))
-	p.jpegSubsample = C.VipsForeignJpegSubsample(params.SubsampleMode)
+	p.jpegSubsample = C.VipsForeignSubsample(params.SubsampleMode)
 	p.jpegTrellisQuant = C.int(boolToInt(params.TrellisQuant))
 	p.jpegOvershootDeringing = C.int(boolToInt(params.OvershootDeringing))
 	p.jpegOptimizeScans = C.int(boolToInt(params.OptimizeScans))
@@ -416,6 +467,18 @@ func vipsSaveTIFFToBuffer(in *C.VipsImage, params TiffExportParams) ([]byte, err
 	p.stripMetadata = C.int(boolToInt(params.StripMetadata))
 	p.quality = C.int(params.Quality)
 	p.tiffCompression = C.VipsForeignTiffCompression(params.Compression)
+	p.tiffPyramid = C.int(boolToInt(params.Pyramid))
+	p.tiffTile = C.int(boolToInt(params.Tile))
+	tileHeight := params.TileHeight
+	tileWidth := params.TileWidth
+	if tileHeight <= 0 {
+		tileHeight = 256
+	}
+	if tileWidth <= 0 {
+		tileWidth = 256
+	}
+	p.tiffTileHeight = C.int(tileHeight)
+	p.tiffTileWidth = C.int(tileWidth)
 
 	return vipsSaveToBuffer(p)
 }
@@ -465,7 +528,7 @@ func vipsSaveJP2KToBuffer(in *C.VipsImage, params Jp2kExportParams) ([]byte, err
 	p.jp2kLossless = C.int(boolToInt(params.Lossless))
 	p.jp2kTileWidth = C.int(params.TileWidth)
 	p.jp2kTileHeight = C.int(params.TileHeight)
-	p.jpegSubsample = C.VipsForeignJpegSubsample(params.SubsampleMode)
+	p.jpegSubsample = C.VipsForeignSubsample(params.SubsampleMode)
 
 	return vipsSaveToBuffer(p)
 }
@@ -494,6 +557,24 @@ func vipsSaveJxlToBuffer(in *C.VipsImage, params JxlExportParams) ([]byte, error
 	p.jxlTier = C.int(params.Tier)
 	p.jxlDistance = C.double(params.Distance)
 	p.jxlEffort = C.int(params.Effort)
+
+	return vipsSaveToBuffer(p)
+}
+
+func vipsSaveMagickToBuffer(in *C.VipsImage, params MagickExportParams) ([]byte, error) {
+	incOpCounter("save_magick_buffer")
+
+	if params.Format == "" {
+		return nil, errors.New("magick format required")
+	}
+	p := C.create_save_params(C.MAGICK)
+	p.inputImage = in
+	p.outputFormat = C.MAGICK
+	p.quality = C.int(params.Quality)
+	p.magickFormat = C.CString(params.Format)
+	p.magickOptimizeGifFrames = C.int(boolToInt(params.OptimizeGifFrames))
+	p.magickOptimizeGifTransparency = C.int(boolToInt(params.OptimizeGifTransparency))
+	p.magickBitDepth = C.int(params.BitDepth)
 
 	return vipsSaveToBuffer(p)
 }
