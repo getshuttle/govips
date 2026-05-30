@@ -3,7 +3,6 @@ module github.com/getshuttle/govips/v2
 go 1.25.0
 
 require (
-	github.com/davidbyttow/govips/v2 v2.18.0
 	github.com/stretchr/testify v1.6.1
 	golang.org/x/image v0.38.0
 	golang.org/x/net v0.52.0
